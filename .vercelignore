@@ -1,0 +1,5 @@
+.totp-storage.php
+.totp-e2e.php
+.env
+.env.*
+.git
