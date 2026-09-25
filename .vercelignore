@@ -1,5 +1,6 @@
 .totp-storage.php
 .totp-e2e.php
+.totp-*.sqlite
 .env
 .env.*
 .git

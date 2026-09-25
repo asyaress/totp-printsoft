@@ -2,48 +2,242 @@
 declare(strict_types=1);
 
 /*
- * Native PHP TOTP demo.
+ * Native PHP TOTP portal.
  *
  * Default first-run credentials (localhost only):
  *   Username: admin
  *   Password: Admin@123
  *
- * For production, set TOTP_ADMIN_USER, TOTP_ADMIN_PASSWORD, TOTP_APP_NAME,
- * and (ideally) TOTP_STORAGE_PATH to a location outside the public web root
- * before the first request.
+ * Vercel production uses DATABASE_URL plus TOTP_ENCRYPTION_KEY. Local
+ * development can keep using the protected file fallback.
  */
 
 const STORAGE_HEADER = "<?php exit; ?>\n";
 const TOTP_PERIOD = 30;
 const TOTP_DIGITS = 6;
 
-$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-    || (isset($_SERVER['SERVER_PORT']) && (int) $_SERVER['SERVER_PORT'] === 443);
-
-session_name('native_totp_session');
-session_set_cookie_params([
-    'lifetime' => 0,
-    'path' => '/',
-    'secure' => $isHttps,
-    'httponly' => true,
-    'samesite' => 'Strict',
-]);
-session_start();
-
-$cspNonce = base64_encode(random_bytes(18));
-header('Content-Type: text/html; charset=UTF-8');
-header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-header('Pragma: no-cache');
-header('X-Content-Type-Options: nosniff');
-header('X-Frame-Options: DENY');
-header('Referrer-Policy: no-referrer');
-header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
-header("Content-Security-Policy: default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; style-src 'nonce-{$cspNonce}'; script-src 'nonce-{$cspNonce}'");
-
 function env_value(string $key, string $fallback): string
 {
     $value = getenv($key);
     return is_string($value) && $value !== '' ? $value : $fallback;
+}
+
+function database_url(): ?string
+{
+    foreach (['DATABASE_URL', 'POSTGRES_URL'] as $name) {
+        $value = getenv($name);
+        if (is_string($value) && trim($value) !== '') {
+            return trim($value);
+        }
+    }
+    return null;
+}
+
+function database_enabled(): bool
+{
+    return database_url() !== null;
+}
+
+function is_vercel_runtime(): bool
+{
+    $value = getenv('VERCEL');
+    return is_string($value) && ($value === '1' || strtolower($value) === 'true');
+}
+
+/** Returns a 32-byte binary key, not the encoded environment value. */
+function encryption_key(bool $required = false): ?string
+{
+    static $resolved = false;
+    static $key = null;
+
+    if (!$resolved) {
+        $resolved = true;
+        $raw = getenv('TOTP_ENCRYPTION_KEY');
+        if (is_string($raw) && trim($raw) !== '') {
+            $raw = trim($raw);
+            if (preg_match('/^[a-f0-9]{64}$/i', $raw) === 1) {
+                $decoded = hex2bin($raw);
+            } else {
+                $decoded = base64_decode($raw, true);
+            }
+            if (!is_string($decoded) || strlen($decoded) !== 32) {
+                throw new RuntimeException('TOTP_ENCRYPTION_KEY harus berupa Base64 32 byte atau 64 karakter hex.');
+            }
+            $key = $decoded;
+        }
+    }
+
+    if ($required && !is_string($key)) {
+        throw new RuntimeException('TOTP_ENCRYPTION_KEY wajib dikonfigurasi untuk penyimpanan database.');
+    }
+    return $key;
+}
+
+function protect_value(string $plaintext, string $purpose): string
+{
+    $key = encryption_key(true);
+    $iv = random_bytes(12);
+    $tag = '';
+    $ciphertext = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, $purpose, 16);
+    if (!is_string($ciphertext) || strlen($tag) !== 16) {
+        throw new RuntimeException('Data sensitif tidak dapat dienkripsi.');
+    }
+    return 'enc:v1:' . base64_encode($iv . $tag . $ciphertext);
+}
+
+function reveal_value(string $protected, string $purpose): string
+{
+    if (strpos($protected, 'enc:v1:') !== 0) {
+        return $protected;
+    }
+    $payload = base64_decode(substr($protected, 7), true);
+    if (!is_string($payload) || strlen($payload) < 29) {
+        throw new RuntimeException('Format data terenkripsi tidak valid.');
+    }
+    $iv = substr($payload, 0, 12);
+    $tag = substr($payload, 12, 16);
+    $ciphertext = substr($payload, 28);
+    $plaintext = openssl_decrypt($ciphertext, 'aes-256-gcm', encryption_key(true), OPENSSL_RAW_DATA, $iv, $tag, $purpose);
+    if (!is_string($plaintext)) {
+        throw new RuntimeException('Data terenkripsi tidak dapat dibuka. Periksa TOTP_ENCRYPTION_KEY.');
+    }
+    return $plaintext;
+}
+
+function database_connection(): PDO
+{
+    static $connection = null;
+    if ($connection instanceof PDO) {
+        return $connection;
+    }
+
+    $url = database_url();
+    if ($url === null) {
+        throw new RuntimeException('DATABASE_URL belum dikonfigurasi.');
+    }
+
+    if (strpos($url, 'sqlite:') === 0) {
+        if (is_vercel_runtime()) {
+            throw new RuntimeException('SQLite tidak persisten di Vercel. Gunakan PostgreSQL pada DATABASE_URL.');
+        }
+        $connection = new PDO($url);
+    } else {
+        $parts = parse_url($url);
+        if (!is_array($parts) || !isset($parts['scheme'], $parts['host'], $parts['path']) || !in_array($parts['scheme'], ['postgres', 'postgresql'], true)) {
+            throw new RuntimeException('DATABASE_URL harus berupa URL PostgreSQL yang valid.');
+        }
+        $query = [];
+        if (isset($parts['query'])) {
+            parse_str((string) $parts['query'], $query);
+        }
+        $host = (string) $parts['host'];
+        $port = isset($parts['port']) ? (int) $parts['port'] : 5432;
+        $database = rawurldecode(ltrim((string) $parts['path'], '/'));
+        $sslmode = isset($query['sslmode']) ? (string) $query['sslmode'] : 'require';
+        $dsn = 'pgsql:host=' . $host . ';port=' . $port . ';dbname=' . $database . ';sslmode=' . $sslmode;
+        $connection = new PDO(
+            $dsn,
+            isset($parts['user']) ? rawurldecode((string) $parts['user']) : '',
+            isset($parts['pass']) ? rawurldecode((string) $parts['pass']) : ''
+        );
+    }
+
+    $connection->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $connection->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    $connection->setAttribute(PDO::ATTR_EMULATE_PREPARES, false);
+    return $connection;
+}
+
+function ensure_database_schema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec('CREATE TABLE IF NOT EXISTS totp_app_state (
+        id SMALLINT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        revision BIGINT NOT NULL DEFAULT 1,
+        updated_at BIGINT NOT NULL
+    )');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS totp_sessions (
+        session_id VARCHAR(128) PRIMARY KEY,
+        payload TEXT NOT NULL,
+        expires_at BIGINT NOT NULL
+    )');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS totp_sessions_expiry_idx ON totp_sessions (expires_at)');
+    $ready = true;
+}
+
+final class DatabaseSessionHandler implements SessionHandlerInterface
+{
+    private PDO $pdo;
+    private int $lifetime;
+
+    public function __construct(PDO $pdo, int $lifetime)
+    {
+        $this->pdo = $pdo;
+        $this->lifetime = $lifetime;
+    }
+
+    public function open(string $path, string $name): bool
+    {
+        return true;
+    }
+
+    public function close(): bool
+    {
+        return true;
+    }
+
+    private function storageId(string $id): string
+    {
+        return hash_hmac('sha256', $id, encryption_key(true));
+    }
+
+    public function read(string $id): string|false
+    {
+        $storageId = $this->storageId($id);
+        $statement = $this->pdo->prepare('SELECT payload FROM totp_sessions WHERE session_id = :id AND expires_at > :now');
+        $statement->execute(['id' => $storageId, 'now' => time()]);
+        $row = $statement->fetch();
+        if (!is_array($row) || !isset($row['payload'])) {
+            return '';
+        }
+        try {
+            return reveal_value((string) $row['payload'], 'session:' . $storageId);
+        } catch (Throwable $exception) {
+            $this->destroy($id);
+            return '';
+        }
+    }
+
+    public function write(string $id, string $data): bool
+    {
+        $storageId = $this->storageId($id);
+        $statement = $this->pdo->prepare('INSERT INTO totp_sessions (session_id, payload, expires_at)
+            VALUES (:id, :payload, :expires_at)
+            ON CONFLICT (session_id) DO UPDATE SET payload = EXCLUDED.payload, expires_at = EXCLUDED.expires_at');
+        return $statement->execute([
+            'id' => $storageId,
+            'payload' => protect_value($data, 'session:' . $storageId),
+            'expires_at' => time() + $this->lifetime,
+        ]);
+    }
+
+    public function destroy(string $id): bool
+    {
+        $statement = $this->pdo->prepare('DELETE FROM totp_sessions WHERE session_id = :id');
+        return $statement->execute(['id' => $this->storageId($id)]);
+    }
+
+    public function gc(int $max_lifetime): int|false
+    {
+        $statement = $this->pdo->prepare('DELETE FROM totp_sessions WHERE expires_at <= :now');
+        $statement->execute(['now' => time()]);
+        return $statement->rowCount();
+    }
 }
 
 function app_name(): string
@@ -77,20 +271,101 @@ function h(?string $value): string
 
 function redirect_home(): void
 {
-    $path = isset($_SERVER['PHP_SELF']) ? (string) $_SERVER['PHP_SELF'] : '/index.php';
+    $requestUri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '/';
+    $path = parse_url($requestUri, PHP_URL_PATH);
+    $path = is_string($path) && $path !== '' ? $path : '/';
     header('Location: ' . $path, true, 303);
     exit;
 }
 
+function initial_store(): array
+{
+    $configuredPassword = getenv('TOTP_ADMIN_PASSWORD');
+    if ((!is_string($configuredPassword) || $configuredPassword === '') && (is_vercel_runtime() || !is_local_request())) {
+        throw new RuntimeException('TOTP_ADMIN_PASSWORD wajib dikonfigurasi sebelum instalasi pertama di server publik.');
+    }
+    $initialPassword = is_string($configuredPassword) && $configuredPassword !== ''
+        ? $configuredPassword
+        : 'Admin@123';
+    return [
+        'version' => 1,
+        'username' => admin_username(),
+        'password_hash' => password_hash($initialPassword, PASSWORD_DEFAULT),
+        'devices' => [],
+        'created_at' => gmdate('c'),
+    ];
+}
+
+function store_for_persistence(array $data): array
+{
+    $key = encryption_key(database_enabled());
+    if (!is_string($key)) {
+        return $data;
+    }
+    foreach ($data['devices'] as &$device) {
+        if (!is_array($device) || empty($device['secret'])) {
+            continue;
+        }
+        $secret = (string) $device['secret'];
+        if (strpos($secret, 'enc:v1:') !== 0) {
+            $purpose = 'totp-device:' . (string) ($device['id'] ?? 'legacy');
+            $device['secret'] = protect_value($secret, $purpose);
+        }
+    }
+    unset($device);
+    return $data;
+}
+
+function store_from_persistence(array $data): array
+{
+    foreach ($data['devices'] as &$device) {
+        if (!is_array($device) || empty($device['secret'])) {
+            continue;
+        }
+        $purpose = 'totp-device:' . (string) ($device['id'] ?? 'legacy');
+        $device['secret'] = reveal_value((string) $device['secret'], $purpose);
+    }
+    unset($device);
+    return $data;
+}
+
+function valid_store(array $data): bool
+{
+    return isset($data['username'], $data['password_hash'], $data['devices']) && is_array($data['devices']);
+}
+
 function save_store(array $data): bool
 {
+    if (database_enabled()) {
+        $pdo = database_connection();
+        ensure_database_schema($pdo);
+        $expectedRevision = isset($GLOBALS['store_revision']) ? (int) $GLOBALS['store_revision'] : 0;
+        if ($expectedRevision < 1) {
+            return false;
+        }
+        $json = json_encode(store_for_persistence($data), JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $statement = $pdo->prepare('UPDATE totp_app_state
+            SET payload = :payload, revision = revision + 1, updated_at = :updated_at
+            WHERE id = 1 AND revision = :revision');
+        $statement->execute([
+            'payload' => $json,
+            'updated_at' => time(),
+            'revision' => $expectedRevision,
+        ]);
+        if ($statement->rowCount() !== 1) {
+            return false;
+        }
+        $GLOBALS['store_revision'] = $expectedRevision + 1;
+        return true;
+    }
+
     $path = storage_path();
     $directory = dirname($path);
     if (!is_dir($directory) || !is_writable($directory)) {
         return false;
     }
 
-    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    $json = json_encode(store_for_persistence($data), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if (!is_string($json)) {
         return false;
     }
@@ -116,22 +391,42 @@ function save_store(array $data): bool
 
 function load_store(): array
 {
+    if (is_vercel_runtime() && !database_enabled()) {
+        throw new RuntimeException('DATABASE_URL PostgreSQL wajib dikonfigurasi untuk deployment Vercel.');
+    }
+
+    if (database_enabled()) {
+        encryption_key(true);
+        $pdo = database_connection();
+        ensure_database_schema($pdo);
+        $statement = $pdo->query('SELECT payload, revision FROM totp_app_state WHERE id = 1');
+        $row = $statement->fetch();
+        if (!is_array($row)) {
+            $initial = initial_store();
+            $json = json_encode(store_for_persistence($initial), JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            $insert = $pdo->prepare('INSERT INTO totp_app_state (id, payload, revision, updated_at)
+                VALUES (1, :payload, 1, :updated_at) ON CONFLICT (id) DO NOTHING');
+            $insert->execute(['payload' => $json, 'updated_at' => time()]);
+            if ($insert->rowCount() === 1) {
+                $GLOBALS['fresh_install'] = true;
+            }
+            $statement = $pdo->query('SELECT payload, revision FROM totp_app_state WHERE id = 1');
+            $row = $statement->fetch();
+        }
+        if (!is_array($row) || !isset($row['payload'], $row['revision'])) {
+            throw new RuntimeException('Data aplikasi tidak dapat dibaca dari database.');
+        }
+        $decoded = json_decode((string) $row['payload'], true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($decoded) || !valid_store($decoded)) {
+            throw new RuntimeException('Data aplikasi di database rusak atau tidak lengkap.');
+        }
+        $GLOBALS['store_revision'] = (int) $row['revision'];
+        return store_from_persistence($decoded);
+    }
+
     $path = storage_path();
     if (!is_file($path)) {
-        $configuredPassword = getenv('TOTP_ADMIN_PASSWORD');
-        if ((!is_string($configuredPassword) || $configuredPassword === '') && !is_local_request()) {
-            throw new RuntimeException('TOTP_ADMIN_PASSWORD wajib dikonfigurasi sebelum instalasi pertama di server publik.');
-        }
-        $initialPassword = is_string($configuredPassword) && $configuredPassword !== ''
-            ? $configuredPassword
-            : 'Admin@123';
-        $initial = [
-            'version' => 1,
-            'username' => admin_username(),
-            'password_hash' => password_hash($initialPassword, PASSWORD_DEFAULT),
-            'devices' => [],
-            'created_at' => gmdate('c'),
-        ];
+        $initial = initial_store();
         if (!save_store($initial)) {
             throw new RuntimeException('Penyimpanan aplikasi tidak dapat dibuat. Pastikan folder ini bisa ditulis oleh PHP.');
         }
@@ -145,11 +440,59 @@ function load_store(): array
     }
 
     $decoded = json_decode(substr($contents, strlen(STORAGE_HEADER)), true);
-    if (!is_array($decoded) || !isset($decoded['username'], $decoded['password_hash'], $decoded['devices']) || !is_array($decoded['devices'])) {
+    if (!is_array($decoded) || !valid_store($decoded)) {
         throw new RuntimeException('Data aplikasi rusak atau tidak lengkap.');
     }
-    return $decoded;
+    return store_from_persistence($decoded);
 }
+
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (isset($_SERVER['SERVER_PORT']) && (int) $_SERVER['SERVER_PORT'] === 443)
+    || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https')
+    || is_vercel_runtime();
+
+try {
+    if (is_vercel_runtime() && !database_enabled()) {
+        throw new RuntimeException('DATABASE_URL PostgreSQL wajib dikonfigurasi untuk deployment Vercel.');
+    }
+    ini_set('session.use_strict_mode', '1');
+    ini_set('session.gc_maxlifetime', '7200');
+    session_name('native_totp_session');
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path' => '/',
+        'secure' => $isHttps,
+        'httponly' => true,
+        'samesite' => 'Strict',
+    ]);
+    if (database_enabled()) {
+        $sessionPdo = database_connection();
+        ensure_database_schema($sessionPdo);
+        encryption_key(true);
+        session_set_save_handler(new DatabaseSessionHandler($sessionPdo, 7200), true);
+    }
+    session_start();
+} catch (Throwable $exception) {
+    http_response_code(500);
+    header('Content-Type: text/html; charset=UTF-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: DENY');
+    header("Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+    $safeMessage = htmlspecialchars($exception->getMessage(), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    echo '<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Kesalahan konfigurasi</title><body><main><h1>Aplikasi belum dapat dijalankan</h1><p>' . $safeMessage . '</p></main></body></html>';
+    exit;
+}
+
+$cspNonce = base64_encode(random_bytes(18));
+header('Content-Type: text/html; charset=UTF-8');
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('Referrer-Policy: no-referrer');
+header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+header("Content-Security-Policy: default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; style-src 'nonce-{$cspNonce}'; script-src 'nonce-{$cspNonce}'");
 
 function csrf_token(): string
 {
@@ -369,7 +712,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $store['devices'][$matchedIndex]['last_counter'] = $matchedCounter;
                     $store['devices'][$matchedIndex]['last_used_at'] = gmdate('c');
                     if (!save_store($store)) {
-                        $error = 'Status keamanan tidak dapat disimpan. Periksa izin folder aplikasi.';
+                        $error = 'Status keamanan berubah bersamaan atau tidak dapat disimpan. Muat ulang lalu coba lagi.';
                     } else {
                         unset($_SESSION['login_attempts'], $_SESSION['pending_enrollment']);
                         session_regenerate_id(true);
@@ -401,7 +744,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'last_counter' => -1,
                 ];
                 if (!save_store($store)) {
-                    $error = 'Perangkat tidak dapat disimpan. Periksa izin folder aplikasi.';
+                    $error = 'Perangkat tidak dapat disimpan karena data berubah bersamaan. Muat ulang lalu coba lagi.';
                 } else {
                     unset($_SESSION['pending_enrollment']);
                     session_regenerate_id(true);

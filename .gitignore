@@ -1,6 +1,7 @@
 # Runtime secrets and local state
 .totp-storage.php
 .totp-e2e.php
+.totp-*.sqlite
 .env
 .env.*
 !.env.example
