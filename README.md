@@ -83,6 +83,7 @@ Setelah deployment berhasil:
 ## Catatan penting
 
 - Deployment Vercel memakai community runtime `vercel-php@0.9.0` dengan PHP 8.5.
+- Koneksi Neon otomatis meneruskan atau menurunkan Endpoint ID untuk kompatibilitas dengan libpq yang belum mendukung SNI.
 - Produksi Vercel menolak SQLite dan menolak berjalan tanpa URL PostgreSQL Neon yang didukung.
 - Data lokal lama di `.totp-storage.php` tidak otomatis dipindah ke database; deployment baru akan melakukan enrollment dari awal.
 - Gunakan database Neon region yang dekat dengan Function Region Vercel untuk mengurangi latency.

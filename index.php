@@ -111,6 +111,60 @@ function reveal_value(string $protected, string $purpose): string
     return $plaintext;
 }
 
+/** @return array{dsn: string, username: string, password: string} */
+function postgres_connection_config(string $url): array
+{
+    $parts = parse_url($url);
+    if (!is_array($parts) || !isset($parts['scheme'], $parts['host'], $parts['path']) || !in_array($parts['scheme'], ['postgres', 'postgresql'], true)) {
+        throw new RuntimeException('URL koneksi harus berupa URL PostgreSQL yang valid.');
+    }
+
+    $query = [];
+    if (isset($parts['query'])) {
+        parse_str((string) $parts['query'], $query);
+    }
+    $host = strtolower((string) $parts['host']);
+    $port = isset($parts['port']) ? (int) $parts['port'] : 5432;
+    $database = rawurldecode(ltrim((string) $parts['path'], '/'));
+    $allowedSslModes = ['disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full'];
+    $sslmode = isset($query['sslmode']) && in_array((string) $query['sslmode'], $allowedSslModes, true)
+        ? (string) $query['sslmode']
+        : 'require';
+
+    if (preg_match('/^[a-z0-9.-]+$/', $host) !== 1 || preg_match('/^[a-zA-Z0-9_.-]+$/', $database) !== 1) {
+        throw new RuntimeException('Host atau nama database PostgreSQL tidak valid.');
+    }
+
+    $endpointId = null;
+    $neonOptions = isset($query['options']) ? (string) $query['options'] : '';
+    if (preg_match('/(?:^|\s)endpoint=([a-z0-9-]+)/i', $neonOptions, $matches) === 1) {
+        $endpointId = strtolower($matches[1]);
+    } else {
+        $hostPrefix = explode('.', $host)[0];
+        $hostPrefix = (string) preg_replace('/-pooler$/', '', $hostPrefix);
+        if (strpos($hostPrefix, 'ep-') === 0 && preg_match('/^[a-z0-9-]+$/', $hostPrefix) === 1) {
+            $endpointId = $hostPrefix;
+        }
+    }
+
+    $dsn = 'pgsql:host=' . $host
+        . ';port=' . $port
+        . ';dbname=' . $database
+        . ';sslmode=' . $sslmode
+        . ';connect_timeout=8';
+    if (is_string($endpointId)) {
+        // Older libpq builds do not send SNI. Neon accepts the endpoint ID
+        // through the PostgreSQL startup options as a compatibility path.
+        $dsn .= ';options=endpoint=' . $endpointId;
+    }
+
+    return [
+        'dsn' => $dsn,
+        'username' => isset($parts['user']) ? rawurldecode((string) $parts['user']) : '',
+        'password' => isset($parts['pass']) ? rawurldecode((string) $parts['pass']) : '',
+    ];
+}
+
 function database_connection(): PDO
 {
     static $connection = null;
@@ -129,24 +183,8 @@ function database_connection(): PDO
         }
         $connection = new PDO($url);
     } else {
-        $parts = parse_url($url);
-        if (!is_array($parts) || !isset($parts['scheme'], $parts['host'], $parts['path']) || !in_array($parts['scheme'], ['postgres', 'postgresql'], true)) {
-            throw new RuntimeException('DATABASE_URL harus berupa URL PostgreSQL yang valid.');
-        }
-        $query = [];
-        if (isset($parts['query'])) {
-            parse_str((string) $parts['query'], $query);
-        }
-        $host = (string) $parts['host'];
-        $port = isset($parts['port']) ? (int) $parts['port'] : 5432;
-        $database = rawurldecode(ltrim((string) $parts['path'], '/'));
-        $sslmode = isset($query['sslmode']) ? (string) $query['sslmode'] : 'require';
-        $dsn = 'pgsql:host=' . $host . ';port=' . $port . ';dbname=' . $database . ';sslmode=' . $sslmode;
-        $connection = new PDO(
-            $dsn,
-            isset($parts['user']) ? rawurldecode((string) $parts['user']) : '',
-            isset($parts['pass']) ? rawurldecode((string) $parts['pass']) : ''
-        );
+        $config = postgres_connection_config($url);
+        $connection = new PDO($config['dsn'], $config['username'], $config['password']);
     }
 
     $connection->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
