@@ -8,7 +8,7 @@ declare(strict_types=1);
  *   Username: admin
  *   Password: Admin@123
  *
- * Vercel production uses DATABASE_URL plus TOTP_ENCRYPTION_KEY. Local
+ * Vercel production uses a Neon PostgreSQL URL plus TOTP_ENCRYPTION_KEY. Local
  * development can keep using the protected file fallback.
  */
 
@@ -24,7 +24,14 @@ function env_value(string $key, string $fallback): string
 
 function database_url(): ?string
 {
-    foreach (['DATABASE_URL', 'POSTGRES_URL'] as $name) {
+    $supportedNames = [
+        'DATABASE_URL',
+        'DATABASE_POSTGRES_URL',
+        'POSTGRES_URL',
+        'DATABASE_POSTGRES_URL_NON_POOLING',
+        'POSTGRES_URL_NON_POOLING',
+    ];
+    foreach ($supportedNames as $name) {
         $value = getenv($name);
         if (is_string($value) && trim($value) !== '') {
             return trim($value);
@@ -113,7 +120,7 @@ function database_connection(): PDO
 
     $url = database_url();
     if ($url === null) {
-        throw new RuntimeException('DATABASE_URL belum dikonfigurasi.');
+        throw new RuntimeException('URL koneksi PostgreSQL Neon belum dikonfigurasi.');
     }
 
     if (strpos($url, 'sqlite:') === 0) {
@@ -392,7 +399,7 @@ function save_store(array $data): bool
 function load_store(): array
 {
     if (is_vercel_runtime() && !database_enabled()) {
-        throw new RuntimeException('DATABASE_URL PostgreSQL wajib dikonfigurasi untuk deployment Vercel.');
+        throw new RuntimeException('URL koneksi PostgreSQL Neon wajib dikonfigurasi untuk deployment Vercel.');
     }
 
     if (database_enabled()) {
@@ -453,7 +460,7 @@ $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
 
 try {
     if (is_vercel_runtime() && !database_enabled()) {
-        throw new RuntimeException('DATABASE_URL PostgreSQL wajib dikonfigurasi untuk deployment Vercel.');
+        throw new RuntimeException('URL koneksi PostgreSQL Neon wajib dikonfigurasi untuk deployment Vercel.');
     }
     ini_set('session.use_strict_mode', '1');
     ini_set('session.gc_maxlifetime', '7200');

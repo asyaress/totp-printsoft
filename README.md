@@ -44,7 +44,7 @@ php -S localhost:8000
 
 1. Di konfigurasi project Vercel, buka **Storage** atau **Marketplace**.
 2. Tambahkan integrasi **Neon Postgres** dan hubungkan ke project ini.
-3. Pastikan integration membuat environment variable `DATABASE_URL` untuk Production dan Preview.
+3. Dengan custom prefix `DATABASE`, integrasi akan membuat `DATABASE_POSTGRES_URL`. Aplikasi juga menerima `DATABASE_URL` atau `POSTGRES_URL`.
 
 Tabel `totp_app_state` dan `totp_sessions` dibuat otomatis pada request pertama.
 
@@ -54,7 +54,7 @@ Tambahkan melalui **Project → Settings → Environment Variables**:
 
 | Nama | Nilai |
 | --- | --- |
-| `DATABASE_URL` | Dibuat oleh integrasi Neon |
+| `DATABASE_POSTGRES_URL` | Dibuat otomatis oleh integrasi Neon dengan prefix `DATABASE` |
 | `TOTP_ENCRYPTION_KEY` | Kunci Base64 acak 32 byte |
 | `TOTP_ADMIN_USER` | Username administrator |
 | `TOTP_ADMIN_PASSWORD` | Password awal yang panjang dan unik |
@@ -83,6 +83,6 @@ Setelah deployment berhasil:
 ## Catatan penting
 
 - Deployment Vercel memakai community runtime `vercel-php@0.9.0` dengan PHP 8.5.
-- Produksi Vercel menolak SQLite dan menolak berjalan tanpa `DATABASE_URL`.
+- Produksi Vercel menolak SQLite dan menolak berjalan tanpa URL PostgreSQL Neon yang didukung.
 - Data lokal lama di `.totp-storage.php` tidak otomatis dipindah ke database; deployment baru akan melakukan enrollment dari awal.
 - Gunakan database Neon region yang dekat dengan Function Region Vercel untuk mengurangi latency.
