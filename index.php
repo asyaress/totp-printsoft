@@ -316,11 +316,32 @@ function h(?string $value): string
 
 function redirect_home(): void
 {
-    $requestUri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '/';
-    $path = parse_url($requestUri, PHP_URL_PATH);
-    $path = is_string($path) && $path !== '' ? $path : '/';
+    redirect_to(request_path());
+}
+
+function redirect_to(string $path): void
+{
+    if ($path === '' || $path[0] !== '/' || preg_match('/[\r\n]/', $path) === 1) {
+        $path = '/';
+    }
     header('Location: ' . $path, true, 303);
     exit;
+}
+
+function request_path(): string
+{
+    $requestUri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '/';
+    $path = parse_url($requestUri, PHP_URL_PATH);
+    return is_string($path) && $path !== '' ? $path : '/';
+}
+
+function reset_key(): ?string
+{
+    $value = getenv('TOTP_RESET_KEY');
+    if (!is_string($value) || strlen(trim($value)) < 32) {
+        return null;
+    }
+    return trim($value);
 }
 
 function initial_store(): array
@@ -334,6 +355,7 @@ function initial_store(): array
         : 'Admin@123';
     return [
         'version' => 1,
+        'auth_version' => 1,
         'username' => admin_username(),
         'password_hash' => password_hash($initialPassword, PASSWORD_DEFAULT),
         'devices' => [],
@@ -683,14 +705,66 @@ function record_login_failure(): void
 
 function forget_authentication(): void
 {
-    unset($_SESSION['authenticated'], $_SESSION['pending_add']);
+    unset($_SESSION['authenticated'], $_SESSION['auth_version'], $_SESSION['pending_add']);
     session_regenerate_id(true);
+}
+
+function store_auth_version(array $store): int
+{
+    return max(1, isset($store['auth_version']) ? (int) $store['auth_version'] : 1);
+}
+
+function reset_rate_limited(): bool
+{
+    $now = time();
+    $attempts = isset($_SESSION['reset_attempts']) && is_array($_SESSION['reset_attempts'])
+        ? $_SESSION['reset_attempts']
+        : [];
+    $attempts = array_values(array_filter($attempts, static function ($time) use ($now): bool {
+        return is_int($time) && $time > $now - 900;
+    }));
+    $_SESSION['reset_attempts'] = $attempts;
+    return count($attempts) >= 5;
+}
+
+function record_reset_failure(): void
+{
+    if (!isset($_SESSION['reset_attempts']) || !is_array($_SESSION['reset_attempts'])) {
+        $_SESSION['reset_attempts'] = [];
+    }
+    $_SESSION['reset_attempts'][] = time();
+}
+
+function destroy_all_authentication_sessions(): void
+{
+    if (database_enabled()) {
+        database_connection()->exec('DELETE FROM totp_sessions');
+    }
+
+    $_SESSION = [];
+    if ((bool) ini_get('session.use_cookies')) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', [
+            'expires' => time() - 42000,
+            'path' => (string) ($params['path'] ?? '/'),
+            'domain' => (string) ($params['domain'] ?? ''),
+            'secure' => (bool) ($params['secure'] ?? false),
+            'httponly' => (bool) ($params['httponly'] ?? true),
+            'samesite' => (string) ($params['samesite'] ?? 'Strict'),
+        ]);
+    }
+    session_destroy();
 }
 
 $error = '';
 $notice = isset($_SESSION['notice']) ? (string) $_SESSION['notice'] : '';
 unset($_SESSION['notice']);
 $freshInstall = !empty($GLOBALS['fresh_install']);
+$isResetRoute = rtrim(request_path(), '/') === '/reset';
+$resetKeyConfigured = reset_key() !== null;
+if ($isResetRoute) {
+    header('X-Robots-Tag: noindex, nofollow, noarchive');
+}
 
 try {
     $store = load_store();
@@ -702,12 +776,58 @@ try {
     exit;
 }
 
+if (!empty($_SESSION['authenticated'])) {
+    $sessionAuthVersion = isset($_SESSION['auth_version']) ? (int) $_SESSION['auth_version'] : 1;
+    if ($sessionAuthVersion !== store_auth_version($store)) {
+        forget_authentication();
+        $notice = 'Sesi lama telah dihentikan. Silakan login kembali.';
+    }
+}
+
+if (!$isResetRoute && (string) ($_GET['reset'] ?? '') === '1') {
+    $notice = 'Authenticator berhasil direset. Login untuk menghubungkan authenticator baru.';
+}
+
 $action = isset($_POST['action']) ? (string) $_POST['action'] : '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!csrf_is_valid()) {
         http_response_code(400);
         $error = 'Sesi formulir sudah tidak valid. Muat ulang halaman lalu coba lagi.';
+    } elseif ($action === 'reset_totp') {
+        if (!$isResetRoute) {
+            http_response_code(404);
+            $error = 'Halaman reset tidak ditemukan.';
+        } elseif (!$resetKeyConfigured) {
+            http_response_code(503);
+            $error = 'Reset belum tersedia. Konfigurasikan TOTP_RESET_KEY di server terlebih dahulu.';
+        } elseif (reset_rate_limited()) {
+            http_response_code(429);
+            $error = 'Terlalu banyak percobaan reset. Tunggu 15 menit lalu coba lagi.';
+        } else {
+            $username = trim((string) ($_POST['username'] ?? ''));
+            $password = (string) ($_POST['password'] ?? '');
+            $submittedResetKey = trim((string) ($_POST['reset_key'] ?? ''));
+            $configuredResetKey = reset_key();
+            $credentialsOk = hash_equals((string) $store['username'], $username)
+                && password_verify($password, (string) $store['password_hash'])
+                && is_string($configuredResetKey)
+                && hash_equals($configuredResetKey, $submittedResetKey);
+
+            if (!$credentialsOk) {
+                record_reset_failure();
+                $error = 'Data reset tidak sesuai.';
+            } else {
+                $store['devices'] = [];
+                $store['auth_version'] = store_auth_version($store) + 1;
+                if (!save_store($store)) {
+                    $error = 'Reset tidak dapat disimpan karena data berubah bersamaan. Muat ulang lalu coba lagi.';
+                } else {
+                    destroy_all_authentication_sessions();
+                    redirect_to('/?reset=1');
+                }
+            }
+        }
     } elseif ($action === 'logout') {
         forget_authentication();
         $_SESSION['notice'] = 'Anda sudah keluar dengan aman.';
@@ -762,6 +882,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         unset($_SESSION['login_attempts'], $_SESSION['pending_enrollment']);
                         session_regenerate_id(true);
                         $_SESSION['authenticated'] = true;
+                        $_SESSION['auth_version'] = store_auth_version($store);
                         $_SESSION['notice'] = 'Login berhasil. Selamat datang kembali.';
                         redirect_home();
                     }
@@ -887,7 +1008,7 @@ if ($pendingAdd !== null && (!isset($pendingAdd['created_at']) || (int) $pending
 $showEnrollment = !$isAuthenticated && $pendingEnrollment !== null;
 $showAddDevice = $isAuthenticated && $pendingAdd !== null;
 $hasDevices = count($store['devices']) > 0;
-$pageTitle = $isAuthenticated ? 'Dashboard' : ($showEnrollment ? 'Hubungkan authenticator' : 'Login aman');
+$pageTitle = $isResetRoute ? 'Reset authenticator' : ($isAuthenticated ? 'Dashboard' : ($showEnrollment ? 'Hubungkan authenticator' : 'Login aman'));
 $qrUri = '';
 $qrSecret = '';
 if ($showEnrollment) {
@@ -913,6 +1034,7 @@ function format_date_id(?string $date): string
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="color-scheme" content="light dark">
+    <?php if ($isResetRoute): ?><meta name="robots" content="noindex,nofollow,noarchive"><?php endif; ?>
     <title><?= h($pageTitle) ?> · <?= h(app_name()) ?></title>
     <style nonce="<?= h($cspNonce) ?>">
         :root {
@@ -931,6 +1053,7 @@ function format_date_id(?string $date): string
             --green: #198754;
             --green-soft: rgba(25, 135, 84, .12);
             --red: #d92d20;
+            --red-hover: #bd2318;
             --red-soft: rgba(217, 45, 32, .10);
             --shadow: 0 24px 60px rgba(27, 39, 61, .13), 0 2px 10px rgba(27, 39, 61, .06);
             --radius-xl: 1.75rem;
@@ -1036,11 +1159,14 @@ function format_date_id(?string $date): string
         .button:active { transform: scale(.975); transition-duration: .08s; }
         .button-primary { color: white; background: var(--blue); box-shadow: 0 8px 20px rgba(8,122,245,.22); }
         .button-primary:hover { background: var(--blue-hover); }
+        .button-reset { color: white; background: var(--red); box-shadow: 0 8px 20px rgba(217,45,32,.2); }
+        .button-reset:hover { background: var(--red-hover); }
         .button-secondary { color: var(--text); background: var(--line); }
         .button-secondary:hover { background: var(--line-strong); }
         .button-ghost { width: auto; min-height: 2.55rem; color: var(--muted); background: transparent; }
         .button-ghost:hover { color: var(--text); background: var(--line); }
         .button-danger { width: auto; min-height: 2.35rem; padding: .5rem .72rem; color: var(--red); background: var(--red-soft); font-size: .82rem; }
+        .button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
         .button svg { width: 1.05rem; height: 1.05rem; }
         .button-row { display: flex; gap: .65rem; margin-top: 1.2rem; }
         .button-row .button { flex: 1; }
@@ -1130,6 +1256,9 @@ function format_date_id(?string $date): string
         @keyframes fade-in { from { opacity: 0; } }
 
         .footer-note { margin: 1.25rem 0 0; color: var(--muted); text-align: center; font-size: .74rem; }
+        .footer-note a { color: inherit; text-underline-offset: .16rem; }
+        .reset-card .brand-mark { background: var(--red); box-shadow: 0 8px 18px rgba(217,45,32,.2), inset 0 1px 0 rgba(255,255,255,.3); }
+        .reset-actions { display: grid; gap: .3rem; margin-top: 1.2rem; }
         .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
         :focus-visible { outline: 3px solid color-mix(in srgb, var(--blue) 50%, transparent); outline-offset: 2px; }
@@ -1167,7 +1296,7 @@ function format_date_id(?string $date): string
                 --bg: #101216; --surface: rgba(31,34,41,.78); --surface-solid: #252932;
                 --text: #f3f4f7; --muted: #a7abb2; --line: rgba(255,255,255,.09); --line-strong: rgba(255,255,255,.16);
                 --blue: #4da2ff; --blue-hover: #70b4ff; --blue-soft: rgba(77,162,255,.14);
-                --green: #54d28c; --green-soft: rgba(84,210,140,.13); --red: #ff7067; --red-soft: rgba(255,112,103,.12);
+                --green: #54d28c; --green-soft: rgba(84,210,140,.13); --red: #ff7067; --red-hover: #ff8a83; --red-soft: rgba(255,112,103,.12);
                 --shadow: 0 25px 65px rgba(0,0,0,.38), 0 2px 12px rgba(0,0,0,.25);
             }
             input[type="text"], input[type="password"] { background: rgba(16,18,22,.55); }
@@ -1192,7 +1321,53 @@ function format_date_id(?string $date): string
 </head>
 <body>
 <main class="app-shell">
-<?php if (!$isAuthenticated): ?>
+<?php if ($isResetRoute): ?>
+    <section class="auth-card reset-card" aria-labelledby="page-title">
+        <div class="brand">
+            <span class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 8.5 6"/><path d="M20.5 3v6h-6"/><path d="M12 8v5l3 2"/></svg>
+            </span>
+            <span><span class="brand-name"><?= h(app_name()) ?></span><span class="brand-kicker">Account recovery</span></span>
+        </div>
+
+        <h1 id="page-title">Reset authenticator</h1>
+        <p class="lede">Gunakan kunci pemulihan server untuk menghapus semua authenticator dan memulai pemasangan dari awal.</p>
+
+        <?php if (!$resetKeyConfigured): ?>
+            <div class="alert alert-error" role="alert"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v6m0 4h.01"/></svg><span>Reset belum aktif. Tambahkan <strong>TOTP_RESET_KEY</strong> minimal 32 karakter di environment server, lalu redeploy.</span></div>
+        <?php else: ?>
+            <div class="alert alert-info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/></svg><span>Semua perangkat authenticator dan sesi login akan dicabut. Tindakan ini tidak dapat dibatalkan.</span></div>
+        <?php endif; ?>
+        <?php if ($error): ?><div class="alert alert-error" role="alert"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v6m0 4h.01"/></svg><span><?= h($error) ?></span></div><?php endif; ?>
+
+        <form method="post" autocomplete="off" data-confirm="Reset semua authenticator dan hentikan seluruh sesi login?">
+            <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
+            <input type="hidden" name="action" value="reset_totp">
+            <div class="field">
+                <label for="username">Username</label>
+                <input id="username" name="username" type="text" value="<?= h((string) ($_POST['username'] ?? '')) ?>" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+            </div>
+            <div class="field">
+                <label for="password">Password</label>
+                <div class="input-wrap">
+                    <input class="password-input" id="password" name="password" type="password" autocomplete="current-password" required>
+                    <button class="icon-button" type="button" data-toggle-password aria-label="Tampilkan password" aria-pressed="false">
+                        <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+                    </button>
+                </div>
+            </div>
+            <div class="field">
+                <label for="reset-key">Kunci pemulihan</label>
+                <input id="reset-key" name="reset_key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+                <p class="hint">Nilai <strong>TOTP_RESET_KEY</strong> yang tersimpan di environment server.</p>
+            </div>
+            <div class="reset-actions">
+                <button class="button button-reset" type="submit" <?= $resetKeyConfigured ? '' : 'disabled' ?>>Reset semua authenticator</button>
+                <a class="button button-ghost" href="/">Kembali ke login</a>
+            </div>
+        </form>
+    </section>
+<?php elseif (!$isAuthenticated): ?>
     <section class="auth-card" aria-labelledby="page-title">
         <div class="brand">
             <span class="brand-mark" aria-hidden="true">
@@ -1266,7 +1441,7 @@ function format_date_id(?string $date): string
                 <?php endif; ?>
                 <button class="button button-primary" type="submit"><?= $hasDevices ? 'Login dengan aman' : 'Lanjutkan' ?></button>
             </form>
-            <p class="footer-note">Dilindungi dengan TOTP berbasis waktu · Data tetap di server Anda</p>
+            <p class="footer-note"><?php if ($hasDevices): ?><a href="/reset">Authenticator hilang? Reset akses</a><br><?php endif; ?>Dilindungi dengan TOTP berbasis waktu · Data tetap di server Anda</p>
         <?php endif; ?>
     </section>
 <?php else: ?>

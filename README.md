@@ -9,13 +9,14 @@ Halaman login TOTP berbasis PHP native tanpa framework atau Composer. QR dibuat 
 - Session serverless disimpan di PostgreSQL, bukan filesystem sementara.
 - Replay counter TOTP memakai optimistic locking agar satu kode tidak diterima dua kali.
 - CSRF protection, rate limiting per session, cookie `HttpOnly`, `Secure`, dan `SameSite=Strict`.
+- Endpoint pemulihan `/reset` memakai kunci terpisah dan mencabut seluruh perangkat serta sesi login.
 - Content Security Policy dan security headers.
 - `.totp-storage.php` dan file environment tidak pernah masuk Git/Vercel.
 
 ## Menjalankan secara lokal dengan file fallback
 
 ```powershell
-php -S localhost:8000
+php -S localhost:8000 index.php
 ```
 
 Buka `http://localhost:8000`. Khusus localhost, kredensial instalasi awal adalah `admin` / `Admin@123`.
@@ -28,7 +29,7 @@ Gunakan PostgreSQL, atau SQLite hanya untuk pengembangan lokal:
 $env:DATABASE_URL = 'sqlite:D:/path/to/project/.totp-local.sqlite'
 $env:TOTP_ENCRYPTION_KEY = php -r "echo base64_encode(random_bytes(32));"
 $env:TOTP_ADMIN_PASSWORD = 'ganti-dengan-password-kuat'
-php -S localhost:8000
+php -S localhost:8000 index.php
 ```
 
 ## Deploy ke Vercel
@@ -59,6 +60,7 @@ Tambahkan melalui **Project → Settings → Environment Variables**:
 | `TOTP_ADMIN_USER` | Username administrator |
 | `TOTP_ADMIN_PASSWORD` | Password awal yang panjang dan unik |
 | `TOTP_APP_NAME` | Nama yang tampil di authenticator |
+| `TOTP_RESET_KEY` | Kunci pemulihan terpisah, minimal 32 karakter |
 
 Buat encryption key secara lokal:
 
@@ -67,6 +69,14 @@ php -r "echo base64_encode(random_bytes(32)), PHP_EOL;"
 ```
 
 Simpan key tersebut di password manager. Jangan menggantinya setelah perangkat TOTP ditambahkan karena secret dan session lama tidak akan dapat didekripsi.
+
+Buat recovery key yang berbeda dari password dan encryption key:
+
+```powershell
+php -r "echo bin2hex(random_bytes(32)), PHP_EOL;"
+```
+
+Simpan hasilnya sebagai `TOTP_RESET_KEY` dan di password manager. Jangan memakai nilai yang sama dengan `TOTP_ADMIN_PASSWORD` atau `TOTP_ENCRYPTION_KEY`.
 
 ### 4. Deploy
 
@@ -79,6 +89,17 @@ Setelah deployment berhasil:
 3. Pindai QR dan verifikasi kode enam digit.
 4. Login ulang dengan password dan kode authenticator.
 5. Tambahkan perangkat authenticator cadangan dari dashboard.
+
+## Reset authenticator
+
+Jika semua perangkat authenticator hilang:
+
+1. Buka `https://domain-anda/reset`.
+2. Masukkan username, password, dan nilai `TOTP_RESET_KEY` dari password manager.
+3. Konfirmasikan reset. Semua authenticator dan sesi login lama langsung dicabut.
+4. Login kembali dengan username dan password, lalu pindai QR baru.
+
+Jika `TOTP_RESET_KEY` baru ditambahkan atau diubah di Vercel, lakukan **Redeploy** agar nilainya tersedia pada deployment aktif.
 
 ## Catatan penting
 
